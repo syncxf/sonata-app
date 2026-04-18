@@ -1,65 +1,245 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
+import ConstitutionPanel from "./components/ConstitutionPanel";
+import GauntletPanel from "./components/GauntletPanel";
+import TracePanel from "./components/TracePanel";
+import type {
+  ApiError,
+  ChatApiResponse,
+  ChatMessage,
+  EvalApiResponse,
+  RedTeamApiResponse,
+  Turn,
+} from "./types";
 
 export default function Home() {
+  const [constitution, setConstitution] = useState("");
+  const [alignedHistory, setAlignedHistory] = useState<ChatMessage[]>([]);
+  const [nakedHistory, setNakedHistory] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [selectedTurnIdx, setSelectedTurnIdx] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [redTeamLoading, setRedTeamLoading] = useState(false);
+  const [redTeamError, setRedTeamError] = useState<string | null>(null);
+
+  const patchTurn = (idx: number, patch: (t: Turn) => Turn) => {
+    setTurns((all) => all.map((t, i) => (i === idx ? patch(t) : t)));
+  };
+
+  const submit = async () => {
+    const userMessage = input.trim();
+    if (!userMessage || loading) return;
+
+    setError(null);
+    setLoading(true);
+    setInput("");
+
+    const constitutionSnapshot = constitution;
+    const alignedMessages: ChatMessage[] = [
+      ...alignedHistory,
+      { role: "user", content: userMessage },
+    ];
+    const nakedMessages: ChatMessage[] = [
+      ...nakedHistory,
+      { role: "user", content: userMessage },
+    ];
+
+    setAlignedHistory(alignedMessages);
+    setNakedHistory(nakedMessages);
+
+    const turnIdx = turns.length;
+    const newTurn: Turn = {
+      turn: turnIdx + 1,
+      userMessage,
+      constitutionSnapshot,
+      aligned: { loading: true, error: null, result: null },
+      naked: { loading: true, error: null, result: null },
+      evaluation: { status: "idle" },
+    };
+    setTurns((all) => [...all, newTurn]);
+    setSelectedTurnIdx(turnIdx);
+
+    const alignedPromise = callChat(constitutionSnapshot, alignedMessages);
+    const nakedPromise = callChat("", nakedMessages);
+
+    alignedPromise
+      .then((result) => {
+        patchTurn(turnIdx, (t) => ({
+          ...t,
+          aligned: { loading: false, error: null, result },
+        }));
+        setAlignedHistory((h) => [
+          ...h,
+          { role: "assistant", content: result.answer },
+        ]);
+        evaluateTurn(turnIdx, userMessage, constitutionSnapshot, result.answer);
+      })
+      .catch((err: Error) => {
+        patchTurn(turnIdx, (t) => ({
+          ...t,
+          aligned: { loading: false, error: err.message, result: null },
+        }));
+      });
+
+    nakedPromise
+      .then((result) => {
+        patchTurn(turnIdx, (t) => ({
+          ...t,
+          naked: { loading: false, error: null, result },
+        }));
+        setNakedHistory((h) => [
+          ...h,
+          { role: "assistant", content: result.answer },
+        ]);
+      })
+      .catch((err: Error) => {
+        patchTurn(turnIdx, (t) => ({
+          ...t,
+          naked: { loading: false, error: err.message, result: null },
+        }));
+      });
+
+    await Promise.allSettled([alignedPromise, nakedPromise]);
+    setLoading(false);
+  };
+
+  const evaluateTurn = async (
+    turnIdx: number,
+    userPrompt: string,
+    constitutionUsed: string,
+    alignedModelResponse: string,
+  ) => {
+    patchTurn(turnIdx, (t) => ({ ...t, evaluation: { status: "pending" } }));
+    try {
+      const res = await fetch("/api/eval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userPrompt,
+          constitution: constitutionUsed,
+          alignedModelResponse,
+        }),
+      });
+      const json = (await res.json()) as EvalApiResponse | ApiError;
+      if (!res.ok || "error" in json) {
+        const msg = "error" in json ? json.error : `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      patchTurn(turnIdx, (t) => ({
+        ...t,
+        evaluation: {
+          status: "done",
+          score: json.score,
+          justification: json.justification,
+          hardenedConstitution: json.hardenedConstitution,
+        },
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Eval failed";
+      patchTurn(turnIdx, (t) => ({
+        ...t,
+        evaluation: { status: "error", message },
+      }));
+    }
+  };
+
+  const reset = () => {
+    setAlignedHistory([]);
+    setNakedHistory([]);
+    setTurns([]);
+    setSelectedTurnIdx(null);
+    setError(null);
+    setRedTeamError(null);
+    setInput("");
+  };
+
+  const runRedTeam = async () => {
+    if (redTeamLoading || loading) return;
+    setRedTeamError(null);
+    setRedTeamLoading(true);
+    try {
+      const res = await fetch("/api/redteam", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ constitution }),
+      });
+      const json = (await res.json()) as RedTeamApiResponse | ApiError;
+      if (!res.ok || "error" in json) {
+        const msg = "error" in json ? json.error : `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      setInput(json.prompt);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Red-team failed";
+      setRedTeamError(message);
+    } finally {
+      setRedTeamLoading(false);
+    }
+  };
+
+  const applyHardened = (hardened: string) => {
+    setConstitution(hardened);
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <div className="flex flex-col h-screen bg-white text-neutral-900">
+      <header className="border-b border-neutral-200 px-6 py-3 flex items-baseline justify-between">
+        <div>
+          <h1 className="text-base font-semibold tracking-tight">Sonata</h1>
+          <p className="text-xs text-neutral-500">
+            Constitutional Sandbox · aligned vs naked · haiku-4-5 + sonnet-4-6 evaluator
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
+        <p className="text-xs text-neutral-400 font-mono">
+          {turns.length} turn{turns.length === 1 ? "" : "s"}
+        </p>
+      </header>
+
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_minmax(0,1fr)_minmax(0,2fr)] min-h-0">
+        <ConstitutionPanel
+          value={constitution}
+          onChange={setConstitution}
+          locked={loading}
+        />
+        <GauntletPanel
+          messages={alignedHistory}
+          input={input}
+          onInputChange={setInput}
+          onSubmit={submit}
+          loading={loading}
+          error={error}
+          onReset={reset}
+          onRedTeam={runRedTeam}
+          redTeamLoading={redTeamLoading}
+          redTeamError={redTeamError}
+        />
+        <TracePanel
+          turns={turns}
+          selectedIdx={selectedTurnIdx}
+          onSelect={setSelectedTurnIdx}
+          onApplyHardened={applyHardened}
+        />
       </main>
     </div>
   );
+}
+
+async function callChat(
+  constitution: string,
+  messages: ChatMessage[],
+): Promise<ChatApiResponse> {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ constitution, messages }),
+  });
+  const json = (await res.json()) as ChatApiResponse | ApiError;
+  if (!res.ok || "error" in json) {
+    const msg = "error" in json ? json.error : `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return json;
 }
